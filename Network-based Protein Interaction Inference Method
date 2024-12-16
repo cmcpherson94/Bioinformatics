@@ -1,0 +1,189 @@
+import networkx as nx
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import precision_score, recall_score, f1_score
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import shortest_path
+
+class NetworkPPIPredictor:
+    def __init__(self, interaction_data):
+        """
+        Initialize Network PPI Predictor
+        
+        :param interaction_data: DataFrame with protein interactions
+        """
+        self.raw_data = interaction_data
+        self.interaction_graph = None
+        self.feature_matrix = None
+        
+    def build_interaction_network(self, confidence_threshold=0.7):
+        """
+        Construct protein interaction network
+        
+        :param confidence_threshold: Minimum interaction confidence
+        :return: NetworkX graph of protein interactions
+        """
+        # Filter interactions by confidence
+        filtered_data = self.raw_data[
+            self.raw_data['confidence'] >= confidence_threshold
+        ]
+        
+        # Create network graph
+        G = nx.from_pandas_edgelist(
+            filtered_data, 
+            source='protein1', 
+            target='protein2', 
+            edge_attr='confidence'
+        )
+        
+        # Add node attributes (if available)
+        for _, row in filtered_data.iterrows():
+            nx.set_node_attributes(
+                G, 
+                {row['protein1']: {'features': row['protein1_features']}},
+            )
+            nx.set_node_attributes(
+                G, 
+                {row['protein2']: {'features': row['protein2_features']}},
+            )
+        
+        self.interaction_graph = G
+        return self
+    
+    def calculate_network_features(self):
+        """
+        Extract network-based features for interaction prediction
+        """
+        # Convert graph to adjacency matrix
+        nodes = list(self.interaction_graph.nodes())
+        adj_matrix = nx.adjacency_matrix(self.interaction_graph, nodelist=nodes)
+        
+        # Compute shortest path matrix
+        shortest_paths = shortest_path(csr_matrix(adj_matrix), directed=False)
+        
+        # Network centrality measures
+        degree_centrality = nx.degree_centrality(self.interaction_graph)
+        betweenness_centrality = nx.betweenness_centrality(self.interaction_graph)
+        
+        # Compile feature matrix
+        feature_dict = {}
+        for node in nodes:
+            feature_dict[node] = {
+                'degree_centrality': degree_centrality.get(node, 0),
+                'betweenness_centrality': betweenness_centrality.get(node, 0),
+                'clustering_coefficient': nx.clustering(self.interaction_graph, node)
+            }
+        
+        self.feature_matrix = pd.DataFrame.from_dict(feature_dict, orient='index')
+        return self
+    
+    def probabilistic_interaction_inference(self, protein_pair):
+        """
+        Infer interaction probability between protein pairs
+        
+        :param protein_pair: Tuple of two proteins to check
+        :return: Interaction probability
+        """
+        protein1, protein2 = protein_pair
+        
+        # Check if proteins exist in the network
+        if protein1 not in self.interaction_graph or protein2 not in self.interaction_graph:
+            return 0.0
+        
+        # Calculate multiple probabilistic inference features
+        features = []
+        
+        # 1. Direct connection probability
+        if self.interaction_graph.has_edge(protein1, protein2):
+            direct_connection = 1.0
+        else:
+            direct_connection = 0.0
+        features.append(direct_connection)
+        
+        # 2. Shortest path length
+        try:
+            path_length = nx.shortest_path_length(
+                self.interaction_graph, 
+                source=protein1, 
+                target=protein2
+            )
+            path_prob = 1 / (path_length + 1)
+        except nx.NetworkXNoPath:
+            path_prob = 0.0
+        features.append(path_prob)
+        
+        # 3. Common neighbors
+        common_neighbors = len(
+            list(nx.common_neighbors(self.interaction_graph, protein1, protein2))
+        )
+        features.append(common_neighbors / len(self.interaction_graph.nodes()))
+        
+        # 4. Jaccard coefficient of neighborhood
+        neighbors1 = set(self.interaction_graph.neighbors(protein1))
+        neighbors2 = set(self.interaction_graph.neighbors(protein2))
+        jaccard_coef = len(neighbors1.intersection(neighbors2)) / len(neighbors1.union(neighbors2))
+        features.append(jaccard_coef)
+        
+        # Simple probabilistic combination
+        interaction_probability = np.mean(features)
+        return interaction_probability
+    
+    def predict_interactions(self, test_pairs):
+        """
+        Predict interactions for given protein pairs
+        
+        :param test_pairs: List of protein pairs to predict
+        :return: Predictions and probabilities
+        """
+        predictions = {}
+        for pair in test_pairs:
+            prob = self.probabilistic_interaction_inference(pair)
+            predictions[pair] = 1 if prob > 0.5 else 0
+        
+        return predictions
+    
+    def evaluate_predictions(self, true_interactions):
+        """
+        Evaluate prediction performance
+        
+        :param true_interactions: Ground truth interactions
+        :return: Performance metrics
+        """
+        y_true = [interaction for _, interaction in true_interactions]
+        y_pred = [self.predict_interactions([(p1, p2)])[((p1, p2))] for p1, p2 in true_interactions]
+        
+        metrics = {
+            'precision': precision_score(y_true, y_pred),
+            'recall': recall_score(y_true, y_pred),
+            'f1_score': f1_score(y_true, y_pred)
+        }
+        
+        return metrics
+
+def main():
+    # Load interaction data (example structure)
+    interaction_data = pd.DataFrame({
+        'protein1': ['P1', 'P2', 'P3', 'P4'],
+        'protein2': ['P2', 'P3', 'P4', 'P1'],
+        'confidence': [0.8, 0.7, 0.9, 0.6],
+        'protein1_features': [None] * 4,
+        'protein2_features': [None] * 4
+    })
+    
+    # Initialize and run network-based PPI predictor
+    predictor = NetworkPPIPredictor(interaction_data)
+    
+    # Workflow
+    (predictor.build_interaction_network()
+              .calculate_network_features()
+    )
+    
+    # Example protein pairs to predict
+    test_pairs = [('P1', 'P2'), ('P3', 'P4')]
+    predictions = predictor.predict_interactions(test_pairs)
+    
+    print("Interaction Predictions:", predictions)
+
+if __name__ == "__main__":
+    main()
